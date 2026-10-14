@@ -12,7 +12,7 @@ DATA = ROOT / 'data'
 DATA.mkdir(exist_ok=True, mode=0o700)
 DB = DATA / 'siteroll.db'
 LOCK = threading.Lock()
-JOB = {'running': False, 'done': 0, 'total': 0, 'message': '尚未检查'}
+JOB = {'running': False, 'done': 0, 'total': 0, 'message': '尚未检查', 'run_ids': [], 'completed': 0}
 OAUTH = {}
 SESSION = secrets.token_urlsafe(32)
 PORT = 8765
@@ -26,6 +26,50 @@ with db() as c:
     CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY, site_id INTEGER, at TEXT, mode TEXT, error TEXT DEFAULT '', total INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS results(run_id INTEGER, url TEXT, data TEXT);
     CREATE TABLE IF NOT EXISTS quota(property TEXT, day TEXT, n INTEGER, PRIMARY KEY(property,day));''')
+
+    columns = {r[1] for r in c.execute('PRAGMA table_info(runs)')}
+    if 'discovered' not in columns:
+        c.execute('ALTER TABLE runs ADD COLUMN discovered INTEGER')
+
+def result_state(row, mode):
+    if row.get('error'): return 'error'
+    if mode == 'gsc':
+        x = row.get('inspection', {}).get('indexStatusResult', {})
+        if x.get('verdict') == 'PASS': return 'indexed'
+        if x.get('verdict') in ('FAIL', 'NEUTRAL'): return 'not_indexed'
+        return 'unknown'
+    if row.get('http', 0) >= 400: return 'http_error'
+    if row.get('noindex'): return 'noindex'
+    if row.get('redirects'): return 'redirect'
+    if row.get('canonical') and row['canonical'] != row.get('final'): return 'canonical'
+    return 'ok'
+
+def run_report(c, run):
+    current = {r['url']: json.loads(r['data']) for r in c.execute('SELECT * FROM results WHERE run_id=?', (run['id'],))}
+    previous = c.execute('SELECT * FROM runs WHERE site_id=? AND mode=? AND id<? ORDER BY id DESC LIMIT 1', (run['site_id'], run['mode'], run['id'])).fetchone()
+    before = {r['url']: json.loads(r['data']) for r in c.execute('SELECT * FROM results WHERE run_id=?', (previous['id'],))} if previous else {}
+    counts = {'checked': 0, 'failed': 0, 'indexed': 0, 'not_indexed': 0, 'unknown': 0}
+    changes = []
+    for url, row in current.items():
+        status = result_state(row, run['mode'])
+        if status == 'error': counts['failed'] += 1
+        else:
+            counts['checked'] += 1
+            if status in ('indexed', 'not_indexed', 'unknown'): counts[status] += 1
+        old = result_state(before[url], run['mode']) if url in before else None
+        change = None
+        if previous and old is None: change = 'first_checked'
+        elif old and status not in ('error', 'unknown') and old not in ('error', 'unknown'):
+            if run['mode'] == 'gsc' and old != 'indexed' and status == 'indexed': change = 'newly_indexed'
+            elif run['mode'] == 'gsc' and old == 'indexed' and status == 'not_indexed': change = 'lost_index'
+            elif run['mode'] == 'technical' and old == 'ok' and status != 'ok': change = 'new_issue'
+            elif run['mode'] == 'technical' and old != 'ok' and status == 'ok': change = 'resolved_issue'
+            elif old != status: change = 'status_changed'
+        if change: changes.append({'url': url, 'kind': change, 'before': old, 'after': status})
+    discovered = run['discovered']
+    return {'run': dict(run), 'counts': counts, 'discovered': discovered,
+            'unchecked': max(0, discovered - len(current)) if discovered is not None else None,
+            'baseline': dict(previous) if previous else None, 'changes': changes}
 
 def validate_url(url):
     p = urllib.parse.urlsplit(url)
@@ -149,9 +193,11 @@ def scan(ids,mode):
         for s in sites:
             now=datetime.now(timezone.utc).isoformat()
             with db() as c:run=c.execute('INSERT INTO runs(site_id,at,mode) VALUES(?,?,?)',(s['id'],now,mode)).lastrowid
+            JOB.setdefault('run_ids', []).append(run)
             try:
                 if mode=='gsc' and not s['property']:raise ValueError('请先为网站选择 GSC 属性')
                 urls=sitemap_urls(s['sitemap'],s['url']);JOB['total']+=len(urls)
+                with db() as c:c.execute('UPDATE runs SET discovered=? WHERE id=?',(len(urls),run))
                 for u in urls:
                     JOB['message']=u
                     try:
@@ -170,13 +216,17 @@ def scan(ids,mode):
                 with db() as c:c.execute('UPDATE runs SET error=? WHERE id=?',(str(e),run))
         JOB['message']='检查完成；请查看结果和检查失败提示'
     except Exception as e:JOB['message']=str(e)
-    finally:JOB['running']=False
+    finally:
+        JOB['running']=False
+        JOB['completed']=JOB.get('completed',0)+1
 
 def snapshot():
     with db() as c:
         sites=[dict(r) for r in c.execute('SELECT * FROM sites ORDER BY id')]
         for s in sites:
             s['runs']=[dict(r) for r in c.execute('SELECT * FROM runs WHERE site_id=? ORDER BY id DESC LIMIT 12',(s['id'],))]
+            latest = c.execute("SELECT * FROM runs WHERE site_id=? AND mode='gsc' ORDER BY id DESC LIMIT 1", (s['id'],)).fetchone()
+            s['index_summary'] = run_report(c, latest) if latest else None
     return {'sites':sites,'job':JOB.copy(),'connected':(DATA/'token.json').exists(),'configured':(ROOT/'credentials.json').exists()}
 
 class Handler(BaseHTTPRequestHandler):
@@ -200,6 +250,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200,'<meta charset="utf-8"><p>Google 已连接。关闭此页，返回 SiteRoll 刷新并导入网站。</p>','text/html')
             if self.headers.get('X-SiteRoll-Token')!=SESSION:return self.send(403,{'error':'请从本地首页访问'})
             if p.path=='/api/state':return self.send(200,snapshot())
+            if p.path=='/api/report':
+                with db() as c:
+                    run=c.execute('SELECT * FROM runs WHERE id=?',(int(q['run'][0]),)).fetchone()
+                    if not run:raise ValueError('检查记录不存在')
+                    report=run_report(c,run)
+                return self.send(200,report)
             if p.path=='/api/results':
                 with db() as c:rows=[{'url':r['url'],**json.loads(r['data'])} for r in c.execute('SELECT * FROM results WHERE run_id=?',(int(q['run'][0]),))]
                 return self.send(200,rows)
@@ -232,7 +288,7 @@ class Handler(BaseHTTPRequestHandler):
                     if JOB['running']:raise ValueError('已有检查正在运行')
                     if v.get('mode') not in ('technical','gsc'):raise ValueError('检查模式错误')
                     if not v.get('ids'):raise ValueError('请先添加网站')
-                    JOB.update(running=True,done=0,total=0,message='正在读取 sitemap')
+                    JOB.update(running=True,done=0,total=0,message='正在读取 sitemap',run_ids=[])
                     threading.Thread(target=scan,args=(v['ids'],v['mode']),daemon=True).start()
                 return self.send(200,{'ok':True})
             if self.path=='/api/connect':
