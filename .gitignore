@@ -1,4 +1,5 @@
 data/
 credentials.json
+service-account.json
 __pycache__/
 *.pyc
